@@ -42,7 +42,7 @@ impl Query {
     async fn all_devices(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Device>> {
         let db = ctx.data::<Db>()?;
         let devices: Vec<Device> = db
-            .query("SELECT * FROM device ORDER BY last_seen DESC")
+            .query("SELECT ip, mac, alias, vendor, first_seen, last_seen FROM device ORDER BY last_seen DESC")
             .await?
             .take(0)?;
         Ok(devices)

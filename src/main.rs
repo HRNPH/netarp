@@ -73,21 +73,19 @@ async fn main() -> Result<()> {
             info!("Starting ARP scan...");
             let iface = scan_iface.clone();
             let net = subnet;
-            let results = match tokio::task::spawn_blocking(move || {
-                scanner::run_arp_scan(&iface, net)
-            })
-            .await
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    log::error!("Scan failed: {}", e);
-                    vec![]
-                }
-                Err(e) => {
-                    log::error!("Task panicked: {}", e);
-                    vec![]
-                }
-            };
+            let results =
+                match tokio::task::spawn_blocking(move || scanner::run_arp_scan(&iface, net)).await
+                {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        log::error!("Scan failed: {}", e);
+                        vec![]
+                    }
+                    Err(e) => {
+                        log::error!("Task panicked: {}", e);
+                        vec![]
+                    }
+                };
 
             if !results.is_empty() {
                 info!("Upserting {} devices...", results.len());
