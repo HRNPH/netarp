@@ -23,8 +23,6 @@ jobs:
             binary: netarp-x86_64-linux-musl
           - target: aarch64-unknown-linux-musl
             binary: netarp-aarch64-linux-musl
-          - target: armv7-unknown-linux-musleabihf
-            binary: netarp-armv7-linux-musleabihf
 
     runs-on: ubuntu-latest
 
