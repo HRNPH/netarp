@@ -7,7 +7,20 @@ Network device discovery using ARP scanning, with a GraphQL API.
 - Rust (edition 2024)
 - Root/admin privileges (required for raw socket ARP)
 
-## Build
+## Install (Linux)
+
+Download the latest binary from [Releases](https://github.com/HRNPH/netarp/releases/latest):
+
+```bash
+# Download
+curl -sL https://github.com/HRNPH/netarp/releases/latest/download/netarp -o netarp
+chmod +x netarp
+
+# Run
+sudo RUST_LOG=info ./netarp
+```
+
+## Build from source
 
 ```bash
 cargo build --release
@@ -66,6 +79,16 @@ The API runs at `http://localhost:4000/graphql` with an interactive Playground a
 { deviceHistory(mac: "20:df:b9:0d:82:59") { deviceMac timestamp kind detail } }
 ```
 
+**Scan history**
+```graphql
+{ scans { id startedAt finishedAt status deviceCount newCount updatedCount failedCount subnet interface } }
+```
+
+**Scan results by scan ID**
+```graphql
+{ scanResults(scanId: "abc123") { ip mac status error } }
+```
+
 ### curl examples
 
 ```bash
@@ -97,3 +120,5 @@ Uses SurrealDB with RocksDB storage. Tables:
 
 - **device** — current device state (ip, mac, alias, vendor, first_seen, last_seen)
 - **event** — history events (discovered, ip_changed)
+- **scan** — scan run sessions with start/end times, status, and device counts
+- **scan_result** — per-device results for each scan run (new, updated, failed)
