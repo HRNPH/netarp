@@ -4,7 +4,7 @@ use axum::response::Html;
 use axum::Extension;
 
 use crate::db::{self, Db};
-use crate::models::{Device, HistoryEvent};
+use crate::models::{Device, HistoryEvent, Scan, ScanResult};
 
 pub type AppSchema = Schema<Query, EmptyMutation, EmptySubscription>;
 
@@ -46,6 +46,37 @@ impl Query {
             .await?
             .take(0)?;
         Ok(devices)
+    }
+
+    async fn scans(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "Max results (default 20)")] limit: Option<i64>,
+        #[graphql(desc = "Offset for pagination")] offset: Option<i64>,
+    ) -> async_graphql::Result<Vec<Scan>> {
+        let db = ctx.data::<Db>()?;
+        let scans = db::get_scans(db, limit.unwrap_or(20), offset.unwrap_or(0)).await?;
+        Ok(scans)
+    }
+
+    async fn scan(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "Scan record ID")] id: String,
+    ) -> async_graphql::Result<Option<Scan>> {
+        let db = ctx.data::<Db>()?;
+        let scan = db::get_scan(db, &id).await?;
+        Ok(scan)
+    }
+
+    async fn scan_results(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "Scan ID to get results for")] scan_id: String,
+    ) -> async_graphql::Result<Vec<ScanResult>> {
+        let db = ctx.data::<Db>()?;
+        let results = db::get_scan_results(db, &scan_id).await?;
+        Ok(results)
     }
 }
 

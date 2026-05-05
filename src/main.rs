@@ -68,9 +68,20 @@ async fn main() -> Result<()> {
     let scan_db = db.clone();
     let scan_iface = iface.clone();
     let scan_interval = Duration::from_secs(args.interval);
+    let subnet_str = subnet.to_string();
     tokio::spawn(async move {
         loop {
             info!("Starting ARP scan...");
+
+            let scan_id = match db::create_scan(&scan_db, &subnet_str, &scan_iface.name).await {
+                Ok(id) => id,
+                Err(e) => {
+                    log::error!("Failed to create scan record: {}", e);
+                    tokio::time::sleep(scan_interval).await;
+                    continue;
+                }
+            };
+
             let iface = scan_iface.clone();
             let net = subnet;
             let results =
@@ -79,19 +90,47 @@ async fn main() -> Result<()> {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => {
                         log::error!("Scan failed: {}", e);
-                        vec![]
+                        let _ = db::fail_scan(&scan_db, &scan_id).await;
+                        tokio::time::sleep(scan_interval).await;
+                        continue;
                     }
                     Err(e) => {
                         log::error!("Task panicked: {}", e);
-                        vec![]
+                        let _ = db::fail_scan(&scan_db, &scan_id).await;
+                        tokio::time::sleep(scan_interval).await;
+                        continue;
                     }
                 };
 
             if !results.is_empty() {
                 info!("Upserting {} devices...", results.len());
-                if let Err(e) = db::upsert_scan_results(&scan_db, results).await {
-                    log::error!("DB update failed: {}", e);
+                match db::upsert_scan_results(&scan_db, results).await {
+                    Ok(summary) => {
+                        let device_count = summary.results.len() as i32;
+                        if let Err(e) =
+                            db::store_scan_results(&scan_db, &scan_id, &summary.results).await
+                        {
+                            log::error!("Failed to store scan results: {}", e);
+                        }
+                        if let Err(e) =
+                            db::complete_scan(&scan_db, &scan_id, device_count, &summary).await
+                        {
+                            log::error!("Failed to complete scan: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("DB update failed: {}", e);
+                        let _ = db::fail_scan(&scan_db, &scan_id).await;
+                    }
                 }
+            } else {
+                let empty = models::UpsertSummary {
+                    new_count: 0,
+                    updated_count: 0,
+                    failed_count: 0,
+                    results: vec![],
+                };
+                let _ = db::complete_scan(&scan_db, &scan_id, 0, &empty).await;
             }
 
             tokio::time::sleep(scan_interval).await;

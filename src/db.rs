@@ -6,7 +6,9 @@ use surrealdb::engine::local::RocksDb;
 use surrealdb::sql::Datetime;
 use surrealdb::Surreal;
 
-use crate::models::{ArpResult, Device, HistoryEvent};
+use crate::models::{
+    ArpResult, Device, HistoryEvent, IndividualResult, Scan, ScanResult, UpsertSummary,
+};
 
 pub type Db = Surreal<surrealdb::engine::local::Db>;
 
@@ -38,6 +40,31 @@ const MIGRATIONS: &[(&str, &str)] = &[
         DEFINE INDEX IF NOT EXISTS idx_device_mac ON device COLUMNS mac;
         DEFINE INDEX IF NOT EXISTS idx_event_mac ON event COLUMNS device_mac;
         DEFINE INDEX IF NOT EXISTS idx_event_ts ON event COLUMNS timestamp;
+        ",
+    ),
+    (
+        "002_scan_tracking",
+        "
+        DEFINE TABLE scan SCHEMAFULL;
+        DEFINE FIELD IF NOT EXISTS started_at ON scan TYPE datetime;
+        DEFINE FIELD IF NOT EXISTS finished_at ON scan TYPE option<datetime>;
+        DEFINE FIELD IF NOT EXISTS subnet ON scan TYPE string;
+        DEFINE FIELD IF NOT EXISTS interface ON scan TYPE string;
+        DEFINE FIELD IF NOT EXISTS status ON scan TYPE string;
+        DEFINE FIELD IF NOT EXISTS device_count ON scan TYPE option<int>;
+        DEFINE FIELD IF NOT EXISTS new_count ON scan TYPE option<int>;
+        DEFINE FIELD IF NOT EXISTS updated_count ON scan TYPE option<int>;
+        DEFINE FIELD IF NOT EXISTS failed_count ON scan TYPE option<int>;
+
+        DEFINE TABLE scan_result SCHEMAFULL;
+        DEFINE FIELD IF NOT EXISTS scan_id ON scan_result TYPE string;
+        DEFINE FIELD IF NOT EXISTS ip ON scan_result TYPE string;
+        DEFINE FIELD IF NOT EXISTS mac ON scan_result TYPE string;
+        DEFINE FIELD IF NOT EXISTS status ON scan_result TYPE string;
+        DEFINE FIELD IF NOT EXISTS error ON scan_result TYPE option<string>;
+
+        DEFINE INDEX IF NOT EXISTS idx_scan_started ON scan COLUMNS started_at;
+        DEFINE INDEX IF NOT EXISTS idx_scan_result_scan_id ON scan_result COLUMNS scan_id;
         ",
     ),
 ];
@@ -100,20 +127,141 @@ async fn run_migrations(db: &Db) -> Result<()> {
     Ok(())
 }
 
-pub async fn upsert_scan_results(db: &Db, results: Vec<ArpResult>) -> Result<()> {
+// --- Scan lifecycle ---
+
+pub async fn create_scan(db: &Db, subnet: &str, interface: &str) -> Result<String> {
+    #[derive(Debug, Deserialize)]
+    struct ScanId {
+        id: String,
+    }
+
+    let result: Option<ScanId> = db
+        .query(
+            "
+            CREATE scan CONTENT {
+                started_at: $now,
+                finished_at: NONE,
+                subnet: $subnet,
+                interface: $interface,
+                status: 'running',
+                device_count: NONE,
+                new_count: NONE,
+                updated_count: NONE,
+                failed_count: NONE
+            } RETURN record::id(id) AS id
+            ",
+        )
+        .bind(("now", Datetime::from(Utc::now())))
+        .bind(("subnet", subnet.to_string()))
+        .bind(("interface", interface.to_string()))
+        .await?
+        .take(0)?;
+
+    let scan_id = result
+        .map(|r| r.id)
+        .ok_or_else(|| anyhow::anyhow!("CREATE scan returned no ID"))?;
+
+    info!("Created scan {}", scan_id);
+    Ok(scan_id)
+}
+
+pub async fn complete_scan(
+    db: &Db,
+    scan_id: &str,
+    device_count: i32,
+    summary: &UpsertSummary,
+) -> Result<()> {
+    db.query(
+        "
+        UPDATE type::thing('scan', $scan_id) SET
+            finished_at = $now,
+            status = 'completed',
+            device_count = $device_count,
+            new_count = $new_count,
+            updated_count = $updated_count,
+            failed_count = $failed_count
+        ",
+    )
+    .bind(("scan_id", scan_id.to_string()))
+    .bind(("now", Datetime::from(Utc::now())))
+    .bind(("device_count", device_count))
+    .bind(("new_count", summary.new_count as i32))
+    .bind(("updated_count", summary.updated_count as i32))
+    .bind(("failed_count", summary.failed_count as i32))
+    .await?;
+
+    info!(
+        "Scan {} completed: {} devices ({} new, {} updated, {} failed)",
+        scan_id, device_count, summary.new_count, summary.updated_count, summary.failed_count
+    );
+    Ok(())
+}
+
+pub async fn fail_scan(db: &Db, scan_id: &str) -> Result<()> {
+    db.query(
+        "
+        UPDATE type::thing('scan', $scan_id) SET
+            finished_at = $now,
+            status = 'failed'
+        ",
+    )
+    .bind(("scan_id", scan_id.to_string()))
+    .bind(("now", Datetime::from(Utc::now())))
+    .await?;
+
+    info!("Scan {} marked as failed", scan_id);
+    Ok(())
+}
+
+pub async fn store_scan_results(
+    db: &Db,
+    scan_id: &str,
+    results: &[IndividualResult],
+) -> Result<()> {
+    for r in results {
+        let _: Option<ScanResultData> = db
+            .create("scan_result")
+            .content(ScanResultData {
+                scan_id: scan_id.to_string(),
+                ip: r.ip.clone(),
+                mac: r.mac.clone(),
+                status: r.status.clone(),
+                error: r.error.clone(),
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+// --- Device upsert ---
+
+pub async fn upsert_scan_results(db: &Db, results: Vec<ArpResult>) -> Result<UpsertSummary> {
     let mut new_count = 0u32;
     let mut updated_count = 0u32;
     let mut failed_count = 0u32;
+    let mut individual = Vec::new();
 
     for result in &results {
         match upsert_device(db, &result.ip, &result.mac).await {
             Ok(true) => {
                 new_count += 1;
                 info!("[OK] NEW device: {} ({})", result.mac, result.ip);
+                individual.push(IndividualResult {
+                    ip: result.ip.clone(),
+                    mac: result.mac.clone(),
+                    status: "new".into(),
+                    error: None,
+                });
             }
             Ok(false) => {
                 updated_count += 1;
                 info!("[OK] UPDATED device: {} ({})", result.mac, result.ip);
+                individual.push(IndividualResult {
+                    ip: result.ip.clone(),
+                    mac: result.mac.clone(),
+                    status: "updated".into(),
+                    error: None,
+                });
             }
             Err(e) => {
                 failed_count += 1;
@@ -123,6 +271,12 @@ pub async fn upsert_scan_results(db: &Db, results: Vec<ArpResult>) -> Result<()>
                     result.ip,
                     e
                 );
+                individual.push(IndividualResult {
+                    ip: result.ip.clone(),
+                    mac: result.mac.clone(),
+                    status: "failed".into(),
+                    error: Some(e.to_string()),
+                });
             }
         }
     }
@@ -134,7 +288,12 @@ pub async fn upsert_scan_results(db: &Db, results: Vec<ArpResult>) -> Result<()>
         failed_count,
         results.len()
     );
-    Ok(())
+    Ok(UpsertSummary {
+        new_count,
+        updated_count,
+        failed_count,
+        results: individual,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -153,6 +312,15 @@ struct EventData {
     timestamp: Datetime,
     kind: String,
     detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ScanResultData {
+    scan_id: String,
+    ip: String,
+    mac: String,
+    status: String,
+    error: Option<String>,
 }
 
 async fn upsert_device(db: &Db, ip: &str, mac: &str) -> Result<bool> {
@@ -215,6 +383,8 @@ async fn upsert_device(db: &Db, ip: &str, mac: &str) -> Result<bool> {
     }
 }
 
+// --- Queries ---
+
 pub async fn get_latest_devices(db: &Db, within_minutes: i64) -> Result<Vec<Device>> {
     let devices: Vec<Device> = db
         .query(
@@ -243,4 +413,77 @@ pub async fn get_device_history(db: &Db, mac: &str) -> Result<Vec<HistoryEvent>>
         .await?
         .take(0)?;
     Ok(events)
+}
+
+pub async fn get_scans(db: &Db, limit: i64, offset: i64) -> Result<Vec<Scan>> {
+    let scans: Vec<Scan> = db
+        .query(
+            "
+            SELECT
+                record::id(id) AS id,
+                started_at,
+                finished_at,
+                subnet,
+                interface,
+                status,
+                device_count,
+                new_count,
+                updated_count,
+                failed_count
+            FROM scan
+            ORDER BY started_at DESC
+            LIMIT $limit START $offset
+            ",
+        )
+        .bind(("limit", limit))
+        .bind(("offset", offset))
+        .await?
+        .take(0)?;
+    Ok(scans)
+}
+
+pub async fn get_scan(db: &Db, id: &str) -> Result<Option<Scan>> {
+    let scan: Option<Scan> = db
+        .query(
+            "
+            SELECT
+                record::id(id) AS id,
+                started_at,
+                finished_at,
+                subnet,
+                interface,
+                status,
+                device_count,
+                new_count,
+                updated_count,
+                failed_count
+            FROM type::thing('scan', $id)
+            ",
+        )
+        .bind(("id", id.to_string()))
+        .await?
+        .take(0)?;
+    Ok(scan)
+}
+
+pub async fn get_scan_results(db: &Db, scan_id: &str) -> Result<Vec<ScanResult>> {
+    let results: Vec<ScanResult> = db
+        .query(
+            "
+            SELECT
+                record::id(id) AS id,
+                scan_id,
+                ip,
+                mac,
+                status,
+                error
+            FROM scan_result
+            WHERE scan_id = $scan_id
+            ORDER BY mac
+            ",
+        )
+        .bind(("scan_id", scan_id.to_string()))
+        .await?
+        .take(0)?;
+    Ok(results)
 }
