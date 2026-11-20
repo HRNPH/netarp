@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     let exporter = cfg
         .influx
         .as_ref()
-        .map(|icfg| influx::InfluxExporter::new(icfg.clone()));
+        .map(|icfg| influx::InfluxExporter::new(icfg.clone(), &cfg.zones));
 
     // Everything the scan loop needs, owned by the task.
     let loop_db = db.clone();

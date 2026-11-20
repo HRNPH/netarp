@@ -17,6 +17,16 @@ pub struct Config {
     #[cfg(feature = "influx")]
     pub influx: Option<InfluxCfg>,
     pub names: Option<NamesCfg>,
+    /// Subnet -> label map. A device's IP is matched against these CIDRs
+    /// (longest prefix wins) and exported with the label as the `zone` tag.
+    /// Example:
+    ///
+    /// ```toml
+    /// [zones]
+    /// "192.168.1.0/24" = "homelab-infra"
+    /// "192.168.2.0/24" = "home-dhcp"
+    /// ```
+    pub zones: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -88,6 +98,14 @@ pub struct InfluxCfg {
     pub measurement: String,
     /// Prefer the NETARP_INFLUX_TOKEN environment variable.
     pub token: Option<String>,
+    /// Emit a `subnet` tag per device, derived from its IP by masking to this
+    /// prefix length (e.g. 24 -> "192.168.1.0/24"). 0 disables the tag.
+    #[serde(default = "default_subnet_prefix")]
+    pub subnet_prefix: u8,
+}
+
+fn default_subnet_prefix() -> u8 {
+    24
 }
 
 #[cfg(feature = "influx")]
