@@ -171,6 +171,12 @@ async fn run_one_scan(
         Some(nc) => names::build_alias_maps(nc),
         None => names::AliasMaps::default(),
     };
+    log::info!(
+        "Alias maps: {} entries ({} MAC, {} IP)",
+        alias_maps.total(),
+        alias_maps.by_mac.len(),
+        alias_maps.by_ip.len()
+    );
 
     if results.is_empty() {
         let empty = models::UpsertSummary {
