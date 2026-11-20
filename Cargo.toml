@@ -1,6 +1,6 @@
 [package]
 name = "netarp"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 description = "Network device discovery using ARP scanning, with SQLite (SeaORM) storage, optional GraphQL API and InfluxDB export"
 license = "MIT"

@@ -133,6 +133,16 @@ pub fn run_arp_scan(
         }
     }
 
+    // Always include ourselves: no ARP request is sent for src_ip, so the
+    // scan would otherwise never list the host running it.
+    if seen.insert(src_ip) {
+        info!("  Found (self): {} -> {}", src_ip, src_mac);
+        results.push(ArpResult {
+            ip: src_ip.to_string(),
+            mac: src_mac.to_string(),
+        });
+    }
+
     info!("Scan complete: {} devices found", results.len());
     Ok(results)
 }
