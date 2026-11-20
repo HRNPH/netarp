@@ -1,12 +1,14 @@
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
+use ipnetwork::Ipv4Network;
 use log::{info, warn};
 use pnet::datalink::{self, Channel, NetworkInterface};
+use pnet::packet::Packet;
 use pnet::packet::arp::{ArpHardwareTypes, ArpOperations, ArpPacket, MutableArpPacket};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket, MutableEthernetPacket};
-use pnet::packet::Packet;
 use pnet::util::MacAddr;
 
 use crate::models::ArpResult;
@@ -28,7 +30,7 @@ pub fn find_default_interface() -> Result<NetworkInterface> {
         .ok_or_else(|| anyhow!("No suitable network interface found"))
 }
 
-pub fn get_interface_subnet(iface: &NetworkInterface) -> Result<ipnetwork::Ipv4Network> {
+pub fn get_interface_subnet(iface: &NetworkInterface) -> Result<Ipv4Network> {
     iface
         .ips
         .iter()
@@ -39,9 +41,12 @@ pub fn get_interface_subnet(iface: &NetworkInterface) -> Result<ipnetwork::Ipv4N
         .ok_or_else(|| anyhow!("No IPv4 address found on interface"))
 }
 
+/// Send ARP requests for every host in every subnet (deduplicated) and listen
+/// for replies for `timeout`.
 pub fn run_arp_scan(
     iface: &NetworkInterface,
-    subnet: ipnetwork::Ipv4Network,
+    subnets: &[Ipv4Network],
+    timeout: Duration,
 ) -> Result<Vec<ArpResult>> {
     let src_mac = iface
         .mac
@@ -56,6 +61,21 @@ pub fn run_arp_scan(
         })
         .ok_or_else(|| anyhow!("No IPv4 address on interface"))?;
 
+    // Dedup targets across overlapping subnets (e.g. /16 iface IP + /24 list).
+    let mut targets: Vec<Ipv4Addr> = HashSet::<Ipv4Addr>::from_iter(
+        subnets
+            .iter()
+            .flat_map(|net| net.iter())
+            .filter(|ip| *ip != src_ip),
+    )
+    .into_iter()
+    .collect();
+    targets.sort_unstable();
+
+    if targets.is_empty() {
+        return Err(anyhow!("No target addresses to scan"));
+    }
+
     let (mut tx, mut rx) = match datalink::channel(iface, Default::default()) {
         Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => return Err(anyhow!("Unsupported channel type")),
@@ -63,45 +83,49 @@ pub fn run_arp_scan(
     };
 
     info!(
-        "Sending ARP requests for {} IPs in {}...",
-        subnet.size(),
-        subnet
+        "Sending ARP requests for {} IPs across {} subnet(s){}...",
+        targets.len(),
+        subnets.len(),
+        subnets
+            .iter()
+            .map(|s| format!(" {}", s))
+            .take(4)
+            .collect::<String>()
     );
 
-    for target_ip in subnet.iter() {
-        if target_ip == src_ip {
-            continue;
-        }
+    for target_ip in &targets {
         let mut buffer = [0u8; 42];
-        build_arp_request(&mut buffer, src_mac, src_ip, target_ip);
+        build_arp_request(&mut buffer, src_mac, src_ip, *target_ip);
         if let Some(Err(e)) = tx.send_to(&buffer, None) {
             warn!("Failed to send ARP to {}: {}", target_ip, e);
         }
     }
 
-    info!("Listening for ARP replies (5s timeout)...");
+    info!(
+        "Listening for ARP replies ({}s timeout)...",
+        timeout.as_secs()
+    );
 
+    let mut seen: HashSet<Ipv4Addr> = HashSet::new();
     let mut results = Vec::new();
     let start = std::time::Instant::now();
-    let deadline = Duration::from_secs(5);
 
-    while start.elapsed() < deadline {
+    while start.elapsed() < timeout {
         match rx.next() {
             Ok(data) => {
-                if let Some(eth) = EthernetPacket::new(data) {
-                    if eth.get_ethertype() == EtherTypes::Arp {
-                        if let Some(arp) = ArpPacket::new(eth.payload()) {
-                            if arp.get_operation() == ArpOperations::Reply {
-                                let ip =
-                                    Ipv4Addr::from(arp.get_sender_proto_addr());
-                                let mac = arp.get_sender_hw_addr();
-                                info!("  Found: {} -> {}", ip, mac);
-                                results.push(ArpResult {
-                                    ip: ip.to_string(),
-                                    mac: mac.to_string(),
-                                });
-                            }
-                        }
+                if let Some(eth) = EthernetPacket::new(data)
+                    && eth.get_ethertype() == EtherTypes::Arp
+                    && let Some(arp) = ArpPacket::new(eth.payload())
+                    && arp.get_operation() == ArpOperations::Reply
+                {
+                    let ip = arp.get_sender_proto_addr();
+                    let mac = arp.get_sender_hw_addr();
+                    if seen.insert(ip) {
+                        info!("  Found: {} -> {}", ip, mac);
+                        results.push(ArpResult {
+                            ip: ip.to_string(),
+                            mac: mac.to_string(),
+                        });
                     }
                 }
             }

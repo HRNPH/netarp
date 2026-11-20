@@ -1,0 +1,13 @@
+[package]
+name = "netarp-migration"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "netarp_migration"
+path = "src/lib.rs"
+
+[dependencies]
+async-std = { version = "1", features = ["attributes", "tokio1"] }
+sea-orm-migration = { version = "1", features = ["sqlx-sqlite", "runtime-tokio"] }

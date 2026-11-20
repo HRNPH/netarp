@@ -1,48 +1,34 @@
+mod config;
 mod db;
-mod graphql;
+mod entity;
 mod models;
+mod names;
 mod scanner;
+
+#[cfg(feature = "graphql")]
+mod graphql;
+
+#[cfg(feature = "influx")]
+mod influx;
 
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use config::{Args, NamesCfg};
 use log::info;
-
-#[derive(Parser)]
-#[command(name = "netarp", about = "Network observer using ARP discovery")]
-struct Args {
-    /// Network interface (auto-detected if omitted)
-    #[arg(short, long)]
-    interface: Option<String>,
-
-    /// Subnet to scan, CIDR notation (auto-detected if omitted)
-    #[arg(short, long)]
-    subnet: Option<String>,
-
-    /// Scan interval in seconds
-    #[arg(short, long, default_value = "300")]
-    interval: u64,
-
-    /// API server port
-    #[arg(short, long, default_value = "4000")]
-    port: u16,
-
-    /// Database path
-    #[arg(long, default_value = "netarp.db")]
-    db_path: String,
-}
+use sea_orm::DatabaseConnection;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
+    let cfg = config::load(&args)?;
 
-    let db = db::init_db(&args.db_path).await?;
-    info!("Database ready");
+    let db = db::connect_and_migrate(&cfg.database.url).await?;
 
     // Resolve interface
-    let iface = match &args.interface {
+    let iface = match &cfg.scanner.interface {
         Some(name) => pnet::datalink::interfaces()
             .into_iter()
             .find(|i| i.name == *name)
@@ -54,105 +40,178 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Resolve subnet
-    let subnet = match &args.subnet {
-        Some(s) => s.parse()?,
+    // Resolve subnets
+    let subnets: Vec<ipnetwork::Ipv4Network> = match &cfg.scanner.subnets {
+        Some(list) => {
+            let mut nets = Vec::with_capacity(list.len());
+            for s in list {
+                nets.push(s.parse()?);
+            }
+            info!("Scanning subnets: {:?}", nets);
+            nets
+        }
         None => {
             let net = scanner::get_interface_subnet(&iface)?;
             info!("Scanning subnet: {}", net);
-            net
+            vec![net]
         }
     };
 
-    // Background scanner
-    let scan_db = db.clone();
-    let scan_iface = iface.clone();
-    let scan_interval = Duration::from_secs(args.interval);
-    let subnet_str = subnet.to_string();
-    tokio::spawn(async move {
+    #[cfg(feature = "influx")]
+    let exporter = cfg
+        .influx
+        .as_ref()
+        .map(|icfg| influx::InfluxExporter::new(icfg.clone()));
+
+    // Everything the scan loop needs, owned by the task.
+    let loop_db = db.clone();
+    let loop_iface = iface.clone();
+    let interval = Duration::from_secs(cfg.scanner.interval_secs);
+    let timeout = Duration::from_secs(cfg.scanner.timeout_secs);
+    let once = cfg.scanner.once;
+    let loop_subnets = subnets.clone();
+    let loop_names = cfg.names.clone();
+    let subnets_str = subnets
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let task_subnets_str = subnets_str.clone();
+
+    let _scanner_task = tokio::spawn(async move {
+        let mut iteration: u64 = 0;
         loop {
-            info!("Starting ARP scan...");
+            iteration += 1;
+            info!("Starting ARP scan #{iteration}...");
+            run_one_scan(
+                &loop_db,
+                &loop_iface,
+                &loop_subnets,
+                &task_subnets_str,
+                timeout,
+                &loop_names,
+                #[cfg(feature = "influx")]
+                exporter.as_ref(),
+            )
+            .await;
 
-            let scan_id = match db::create_scan(&scan_db, &subnet_str, &scan_iface.name).await {
-                Ok(id) => id,
-                Err(e) => {
-                    log::error!("Failed to create scan record: {}", e);
-                    tokio::time::sleep(scan_interval).await;
-                    continue;
-                }
-            };
-
-            let iface = scan_iface.clone();
-            let net = subnet;
-            let results =
-                match tokio::task::spawn_blocking(move || scanner::run_arp_scan(&iface, net)).await
-                {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => {
-                        log::error!("Scan failed: {}", e);
-                        let _ = db::fail_scan(&scan_db, &scan_id).await;
-                        tokio::time::sleep(scan_interval).await;
-                        continue;
-                    }
-                    Err(e) => {
-                        log::error!("Task panicked: {}", e);
-                        let _ = db::fail_scan(&scan_db, &scan_id).await;
-                        tokio::time::sleep(scan_interval).await;
-                        continue;
-                    }
-                };
-
-            if !results.is_empty() {
-                info!("Upserting {} devices...", results.len());
-                match db::upsert_scan_results(&scan_db, results).await {
-                    Ok(summary) => {
-                        let device_count = summary.results.len() as i32;
-                        if let Err(e) =
-                            db::store_scan_results(&scan_db, &scan_id, &summary.results).await
-                        {
-                            log::error!("Failed to store scan results: {}", e);
-                        }
-                        if let Err(e) =
-                            db::complete_scan(&scan_db, &scan_id, device_count, &summary).await
-                        {
-                            log::error!("Failed to complete scan: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("DB update failed: {}", e);
-                        let _ = db::fail_scan(&scan_db, &scan_id).await;
-                    }
-                }
-            } else {
-                let empty = models::UpsertSummary {
-                    new_count: 0,
-                    updated_count: 0,
-                    failed_count: 0,
-                    results: vec![],
-                };
-                let _ = db::complete_scan(&scan_db, &scan_id, 0, &empty).await;
+            if once {
+                info!("scanner.once is set — exiting after single scan");
+                break;
             }
-
-            tokio::time::sleep(scan_interval).await;
+            tokio::time::sleep(interval).await;
         }
     });
 
-    // GraphQL API
-    let schema = graphql::create_schema(db);
-    let app = axum::Router::new()
-        .route("/graphql", axum::routing::post(graphql::graphql_handler))
-        .route("/graphql", axum::routing::get(graphql::graphql_playground))
-        .layer(axum::Extension(schema));
+    // GraphQL API (feature "graphql"); without it we just wait on the scanner.
+    #[cfg(feature = "graphql")]
+    {
+        let schema = graphql::create_schema(db);
+        let app = axum::Router::new()
+            .route("/graphql", axum::routing::post(graphql::graphql_handler))
+            .route("/graphql", axum::routing::get(graphql::graphql_playground))
+            .layer(axum::Extension(schema));
 
-    let addr = format!("0.0.0.0:{}", args.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("NetArp server started");
-    info!("  GraphQL API:  http://{}", listener.local_addr()?);
-    info!("  Playground:   http://{}/graphql", listener.local_addr()?);
-    info!("  Interface:    {}", iface.name);
-    info!("  Subnet:       {}", subnet);
-    info!("  Scan interval: {}s", args.interval);
-    axum::serve(listener, app).await?;
+        let listener = tokio::net::TcpListener::bind(&cfg.api.bind).await?;
+        info!("NetArp server started");
+        info!("  GraphQL API:  http://{}", listener.local_addr()?);
+        info!("  Playground:   http://{}/graphql", listener.local_addr()?);
+        info!("  Interface:    {}", iface.name);
+        info!("  Subnets:      {}", subnets_str);
+        info!("  Interval:     {:?}", interval);
+        axum::serve(listener, app).await?;
+    }
+
+    #[cfg(not(feature = "graphql"))]
+    _scanner_task.await?;
 
     Ok(())
+}
+
+#[cfg_attr(not(feature = "influx"), allow(unused_variables))]
+async fn run_one_scan(
+    db: &DatabaseConnection,
+    iface: &pnet::datalink::NetworkInterface,
+    subnets: &[ipnetwork::Ipv4Network],
+    subnets_str: &str,
+    timeout: Duration,
+    names_cfg: &Option<NamesCfg>,
+    #[cfg(feature = "influx")] exporter: Option<&influx::InfluxExporter>,
+) {
+    let scan_id = match db::repo::create_scan(db, subnets_str, &iface.name).await {
+        Ok(id) => id,
+        Err(e) => {
+            log::error!("Failed to create scan record: {e}");
+            return;
+        }
+    };
+
+    let scan_iface = iface.clone();
+    let scan_nets = subnets.to_vec();
+    let results = match tokio::task::spawn_blocking(move || {
+        scanner::run_arp_scan(&scan_iface, &scan_nets, timeout)
+    })
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            log::error!("Scan failed: {e}");
+            let _ = db::repo::fail_scan(db, scan_id).await;
+            return;
+        }
+        Err(e) => {
+            log::error!("Task panicked: {e}");
+            let _ = db::repo::fail_scan(db, scan_id).await;
+            return;
+        }
+    };
+
+    // Alias map is rebuilt every scan so the names file can change at runtime.
+    let alias_map = match names_cfg {
+        Some(nc) => names::build_alias_map(nc),
+        None => std::collections::HashMap::new(),
+    };
+
+    if results.is_empty() {
+        let empty = models::UpsertSummary {
+            new_count: 0,
+            updated_count: 0,
+            failed_count: 0,
+            results: vec![],
+        };
+        let _ = db::repo::complete_scan(db, scan_id, 0, &empty).await;
+        return;
+    }
+
+    info!("Upserting {} devices...", results.len());
+    match db::repo::upsert_scan_results(db, results, &alias_map).await {
+        Ok((summary, devices)) => {
+            let device_count = summary.results.len() as i32;
+            if let Err(e) = db::repo::store_scan_results(db, scan_id, &summary.results).await {
+                log::error!("Failed to store scan results: {e}");
+            }
+            if let Err(e) = db::repo::complete_scan(db, scan_id, device_count, &summary).await {
+                log::error!("Failed to complete scan: {e}");
+            }
+
+            #[cfg(feature = "influx")]
+            if let Some(ex) = exporter {
+                let exports: Vec<influx::ExportDevice<'_>> = devices
+                    .iter()
+                    .map(|d| influx::ExportDevice {
+                        ip: &d.ip,
+                        mac: &d.mac,
+                        alias: d.alias.as_deref(),
+                        vendor: d.vendor.as_deref(),
+                        first_seen: d.first_seen,
+                    })
+                    .collect();
+                ex.write(&exports, chrono::Utc::now()).await;
+            }
+        }
+        Err(e) => {
+            log::error!("DB update failed: {e}");
+            let _ = db::repo::fail_scan(db, scan_id).await;
+        }
+    }
 }

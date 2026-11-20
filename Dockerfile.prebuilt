@@ -1,0 +1,8 @@
+# Expects a static binary named `netarp` in the build context.
+# COPY-only: builds for any architecture without emulation.
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY netarp /usr/local/bin/netarp
+
+VOLUME ["/var/lib/netarp"]
+ENTRYPOINT ["/usr/local/bin/netarp"]

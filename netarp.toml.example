@@ -1,0 +1,36 @@
+# netarp configuration example.
+# Copy to netarp.toml (or /etc/netarp/config.toml) and edit.
+# Precedence: defaults < this file < NETARP_* environment < CLI flags.
+
+[scanner]
+# interface = "eth0"                     # autodetected when omitted
+subnets = [
+    "192.168.1.0/24",
+    "192.168.2.0/24",
+    "192.168.3.0/24",
+]                                        # autodetected when omitted
+interval_secs = 120
+timeout_secs = 5
+# once = false                           # scan once and exit (testing)
+
+[database]
+url = "sqlite:///var/lib/netarp/netarp.db?mode=rwc"
+
+[api]                                    # requires feature "graphql"
+bind = "0.0.0.0:4000"
+
+# Presence of this section enables InfluxDB export (feature "influx").
+[influx]
+url = "http://192.168.3.100:8086"
+org = "magika"
+bucket = "network"
+measurement = "lan"
+# Prefer: export NETARP_INFLUX_TOKEN=... (never commit tokens)
+# token = "..."
+
+# Presence of this section enables hostname aliasing: each scan, every name
+# in the file is resolved and matching discovered IPs get the name as alias.
+# The file is re-read every scan, so it can be generated externally.
+[names]
+file = "/etc/netarp/names.txt"
+suffix = "magika"

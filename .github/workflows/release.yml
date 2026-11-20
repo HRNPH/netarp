@@ -4,15 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Tag version (e.g. v1.0.1). Leave empty to use Cargo.toml version."
+        description: "Tag version (e.g. v0.2.0). Leave empty to use Cargo.toml version."
         required: false
         type: string
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  build-binaries:
     strategy:
       fail-fast: false
       matrix:
@@ -47,14 +54,24 @@ jobs:
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/netarp target/${{ matrix.binary }}
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: target/${{ matrix.binary }}
+
       - name: Determine version tag
         id: version
         run: |
           if [ -n "${{ inputs.version }}" ]; then
             echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           else
-            VER=$(grep '^version' Cargo.toml | head -1 | awk -F'"' '{print $2}')
-            echo "tag=v${VER}" >> "$GITHUB_OUTPUT"
+            REF="${GITHUB_REF_NAME}"
+            if [[ "$REF" == v* ]]; then
+              echo "tag=${REF}" >> "$GITHUB_OUTPUT"
+            else
+              VER=$(grep '^version' Cargo.toml | head -1 | awk -F'"' '{print $2}')
+              echo "tag=v${VER}" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Upload release artifact
@@ -64,3 +81,85 @@ jobs:
           name: Release ${{ steps.version.outputs.tag }}
           files: target/${{ matrix.binary }}
           generate_release_notes: true
+
+  build-images:
+    needs: build-binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            binary: netarp-x86_64-linux-musl
+          - platform: linux/arm64
+            binary: netarp-aarch64-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+      - name: Prepare context
+        run: |
+          cp ${{ matrix.binary }} netarp
+          chmod +x netarp
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.prebuilt
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+      - name: Save digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+
+  merge-images:
+    needs: build-images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+      - name: Determine tag
+        id: version
+        run: |
+          REF="${GITHUB_REF_NAME}"
+          if [[ "$REF" == v* ]]; then echo "tag=${REF}" >> "$GITHUB_OUTPUT";
+          elif [ -n "${{ inputs.version }}" ]; then echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT";
+          else
+            VER=$(curl -sfL https://raw.githubusercontent.com/${{ github.repository }}/main/Cargo.toml | grep '^version' | head -1 | awk -F'"' '{print $2}')
+            echo "tag=v${VER}" >> "$GITHUB_OUTPUT";
+          fi
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@%s ' *)
+      - name: Summary
+        run: |
+          echo "### Image published" >> $GITHUB_STEP_SUMMARY
+          echo "\`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
