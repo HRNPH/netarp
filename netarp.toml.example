@@ -34,3 +34,14 @@ measurement = "lan"
 [names]
 file = "/etc/netarp/names.txt"
 suffix = "magika"
+
+# Optional: zone labels. Devices matching a CIDR (longest prefix wins) are
+# exported with the label as the `zone` tag alongside the raw `subnet` tag.
+[zones]
+"192.168.1.0/24" = "homelab-infra"
+"192.168.2.0/24" = "home-dhcp"
+"192.168.3.0/24" = "raspberry-pi"
+
+[influx]
+# subnet tag prefix length (default 24; 0 disables the subnet tag)
+# subnet_prefix = 24
