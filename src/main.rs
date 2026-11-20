@@ -166,10 +166,10 @@ async fn run_one_scan(
         }
     };
 
-    // Alias map is rebuilt every scan so the names file can change at runtime.
-    let alias_map = match names_cfg {
-        Some(nc) => names::build_alias_map(nc),
-        None => std::collections::HashMap::new(),
+    // Alias maps are rebuilt every scan so the names file can change at runtime.
+    let alias_maps = match names_cfg {
+        Some(nc) => names::build_alias_maps(nc),
+        None => names::AliasMaps::default(),
     };
 
     if results.is_empty() {
@@ -184,7 +184,7 @@ async fn run_one_scan(
     }
 
     info!("Upserting {} devices...", results.len());
-    match db::repo::upsert_scan_results(db, results, &alias_map).await {
+    match db::repo::upsert_scan_results(db, results, &alias_maps).await {
         Ok((summary, devices)) => {
             let device_count = summary.results.len() as i32;
             if let Err(e) = db::repo::store_scan_results(db, scan_id, &summary.results).await {

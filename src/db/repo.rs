@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use anyhow::Result;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
@@ -7,6 +5,7 @@ use sea_orm::*;
 
 use crate::entity::{device, event, scan, scan_result};
 use crate::models::{Device, HistoryEvent, IndividualResult, Scan, ScanResult, UpsertSummary};
+use crate::names::AliasMaps;
 
 // --- Scan lifecycle ---
 
@@ -105,7 +104,7 @@ pub async fn store_scan_results(
 pub async fn upsert_scan_results(
     db: &DatabaseConnection,
     results: Vec<crate::models::ArpResult>,
-    alias_map: &HashMap<String, String>,
+    aliases: &AliasMaps,
 ) -> Result<(UpsertSummary, Vec<device::Model>)> {
     let mut new_count = 0u32;
     let mut updated_count = 0u32;
@@ -114,7 +113,7 @@ pub async fn upsert_scan_results(
     let mut devices = Vec::new();
 
     for result in &results {
-        match upsert_device(db, &result.ip, &result.mac, alias_map).await {
+        match upsert_device(db, &result.ip, &result.mac, aliases).await {
             Ok((is_new, model)) => {
                 if is_new {
                     new_count += 1;
@@ -179,8 +178,15 @@ async fn upsert_device(
     db: &DatabaseConnection,
     ip: &str,
     mac: &str,
-    alias_map: &HashMap<String, String>,
+    aliases: &AliasMaps,
 ) -> Result<(bool, device::Model)> {
+    // MAC match wins (stable identity), IP match as fallback (DNS names).
+    let wanted_alias = aliases
+        .by_mac
+        .get(&mac.to_ascii_lowercase())
+        .or_else(|| aliases.by_ip.get(ip))
+        .cloned();
+
     let existing = device::Entity::find_by_id(mac.to_string()).one(db).await?;
 
     match existing {
@@ -195,7 +201,6 @@ async fn upsert_device(
                 .await?;
             }
 
-            let wanted_alias = alias_map.get(ip).cloned();
             let alias_changed = match (&dev.alias, &wanted_alias) {
                 (Some(a), Some(b)) => a != b,
                 (None, Some(_)) => true,
@@ -222,7 +227,7 @@ async fn upsert_device(
         }
         None => {
             let now = Utc::now();
-            let alias = alias_map.get(ip).cloned();
+            let alias = wanted_alias;
             let model = device::ActiveModel {
                 mac: Set(mac.to_string()),
                 ip: Set(ip.to_string()),
