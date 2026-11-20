@@ -55,13 +55,15 @@ impl InfluxExporter {
         let mut lines = Vec::with_capacity(devices.len());
         for d in devices {
             let first_seen_ns = d.first_seen.timestamp_nanos_opt().unwrap_or_default();
-            let mut tags = format!("ip={},mac={}", escape_tag(d.ip), escape_tag(d.mac));
-            if let Some(a) = d.alias {
-                tags.push_str(&format!(",hostname={}", escape_tag(a)));
-            }
-            if let Some(v) = d.vendor {
-                tags.push_str(&format!(",vendor={}", escape_tag(v)));
-            }
+            // Tags are always emitted (with "unknown" fallbacks) so the series
+            // schema stays stable for downstream pivots.
+            let tags = format!(
+                "ip={},mac={},hostname={},vendor={}",
+                escape_tag(d.ip),
+                escape_tag(d.mac),
+                escape_tag(d.alias.unwrap_or("unknown")),
+                escape_tag(d.vendor.unwrap_or("unknown")),
+            );
             lines.push(format!(
                 "{},{} alive=1i,first_seen_ns={}i {}",
                 self.cfg.measurement, tags, first_seen_ns, ts
@@ -150,7 +152,7 @@ mod tests {
         let body = ex.build_body(&[dev], t);
         assert_eq!(
             body,
-            "lan,ip=192.168.1.101,mac=de:a6:32:ff:fe:76,hostname=rakazo alive=1i,first_seen_ns=1700000000000000000i 1700000000000000000"
+            "lan,ip=192.168.1.101,mac=de:a6:32:ff:fe:76,hostname=rakazo,vendor=unknown alive=1i,first_seen_ns=1700000000000000000i 1700000000000000000"
         );
     }
 }
